@@ -66,6 +66,7 @@ st.markdown("""
     .bose-letter:nth-child(2) { animation-delay: 0.15s; }
     .bose-letter:nth-child(3) { animation-delay: 0.3s; }
     .bose-letter:nth-child(4) { animation-delay: 0.45s; }
+    .bose-letter:nth-child(4) { animation-delay: 0.60s; }
 
     /* Status Text */
     .bose-status {
@@ -278,10 +279,11 @@ if all(current_files):
                 loader_placeholder.markdown("""
                 <div class="bose-loader-overlay">
                     <div class="bose-juggler">
-                        <span class="bose-letter">B</span>
-                        <span class="bose-letter">O</span>
-                        <span class="bose-letter">S</span>
-                        <span class="bose-letter">E</span>
+                        <span class="bose-letter">A</span>
+                        <span class="bose-letter">M</span>
+                        <span class="bose-letter">I</span>
+                        <span class="bose-letter">C</span>
+                        <span class="bose-letter">A</span>
                     </div>
                     <div class="bose-status">Processing Data...</div>
                 </div>
