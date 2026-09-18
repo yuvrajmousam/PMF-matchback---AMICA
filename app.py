@@ -335,18 +335,35 @@ if all(current_files):
 
                     skip_triples = set()
                     gran_xl = pd.ExcelFile(gran_file)
-                    season_pattern = re.compile(r"^S\d\s20\d{2}$")
                     
+                    # 3a. Check standard MAP sheets
                     for code in map_df["MAP"].dropna().unique():
                         sheet_code = str(code)
                         if sheet_code in gran_xl.sheet_names:
                             gdf = pd.read_excel(gran_file, sheet_name=sheet_code, dtype=str).iloc[:, :4]
-                            gdf.columns = [c.upper() for c in gdf.columns]
+                            gdf.columns = [str(c).strip().upper() for c in gdf.columns]
                             if "VARIABLE" in gdf.columns and "CONTRIBUTION" in gdf.columns:
-                                gdf = gdf[gdf["CONTRIBUTION"].astype(str).str.match(season_pattern, na=False)]
+                                gdf = gdf.dropna(subset=["CONTRIBUTION"])
                                 for _, row in gdf.iterrows():
-                                    skip_triples.add((f"{str(row['VARIABLE']).strip().upper()}_PMF", str(row["CONTRIBUTION"]).strip().upper(), sheet_code))
+                                    contrib_val = str(row["CONTRIBUTION"]).strip().upper()
+                                    if contrib_val not in ["NAN", "NONE", ""]:
+                                        skip_triples.add((f"{str(row['VARIABLE']).strip().upper()}_PMF", contrib_val, sheet_code))
 
+                    # 3b. Force check any Override sheets
+                    override_sheets = [s for s in gran_xl.sheet_names if "override" in s.lower()]
+                    for over_sheet in override_sheets:
+                        gdf_over = pd.read_excel(gran_file, sheet_name=over_sheet, dtype=str)
+                        gdf_over.columns = [str(c).strip().upper() for c in gdf_over.columns]
+                        
+                        # Use GEOGRAPHY and let geo2map translate it to the MAP code
+                        if "GEOGRAPHY" in gdf_over.columns and "VARIABLE" in gdf_over.columns and "CONTRIBUTION" in gdf_over.columns:
+                            gdf_over = gdf_over.dropna(subset=["CONTRIBUTION"])
+                            for _, row in gdf_over.iterrows():
+                                contrib_val = str(row["CONTRIBUTION"]).strip().upper()
+                                if contrib_val not in ["NAN", "NONE", ""]:
+                                    raw_geo = str(row["GEOGRAPHY"]).strip().upper()
+                                    mapped_code = geo2map.get(raw_geo, raw_geo) 
+                                    skip_triples.add((f"{str(row['VARIABLE']).strip().upper()}_PMF", contrib_val, mapped_code))
                     # 4. Apply Multipliers
                     result_ads = ads_df.copy()
                     skipped_rows = []
