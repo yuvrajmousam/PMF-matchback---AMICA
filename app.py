@@ -407,7 +407,7 @@ if all(current_files):
                                     mapped_code = geo2map.get(raw_geo, raw_geo) 
                                     skip_triples.add((f"{str(row['VARIABLE']).strip().upper()}_PMF", contrib_val, mapped_code))
 
-                    # 4. Apply Multipliers
+                    # 4. Apply Multipliers (HIGH PERFORMANCE OPTIMIZATION)
                     result_ads = ads_df.copy()
                     skipped_rows = []
                     multiplied_rows = []
@@ -419,9 +419,14 @@ if all(current_files):
 
                     common_vars = [c for c in ads_df.columns if "_PMF" in c.upper()]
 
-                    G_arr = ads_work["_G"].values
-                    S_arr = ads_work["_S"].values
-                    M_arr = ads_work["_MAP"].values
+                    # PRE-COMPUTE NORMALIZED ARRAYS OUTSIDE THE LOOP (Saves millions of function calls)
+                    G_arr_raw = ads_work["_G"].values
+                    S_arr_raw = ads_work["_S"].values
+                    M_arr_raw = ads_work["_MAP"].values
+                    
+                    G_arr_norm = [normalize_geo(g) for g in G_arr_raw]
+                    S_arr_norm = [normalize_season(s) for s in S_arr_raw]
+                    M_arr_norm = [normalize_geo(m) if pd.notna(m) else None for m in M_arr_raw]
 
                     for col in common_vars:
                         col_u = col.upper()
@@ -433,39 +438,48 @@ if all(current_files):
                         v_type = var_to_type.get(col_base)
                         t_min, t_max = tolerance_map.get(v_type, (0.95, 1.05))
 
-                        col_values = pd.to_numeric(result_ads[col], errors="coerce")
+                        # Convert columns to fast NumPy arrays for processing
+                        col_values = pd.to_numeric(result_ads[col], errors="coerce").values
+                        new_col_strings = result_ads[col].values.copy()
                         
                         for i in range(len(result_ads)):
-                            season = S_arr[i]
-                            season_norm = normalize_season(season)
-                            map_code = M_arr[i]
-                            geo = G_arr[i]
+                            season_raw = S_arr_raw[i]
+                            season_norm = S_arr_norm[i]
+                            map_code_raw = M_arr_raw[i]
+                            map_code_norm = M_arr_norm[i]
+                            geo_raw = G_arr_raw[i]
+                            geo_norm = G_arr_norm[i]
 
-                            if (col_u, season_norm, map_code) in skip_triples:
-                                skipped_rows.append((i, geo, season, map_code, col, "Granular Spec"))
+                            if (col_u, season_norm, map_code_raw) in skip_triples:
+                                skipped_rows.append((i, geo_raw, season_raw, map_code_raw, col, "Granular Spec"))
                                 continue
                             
-                            # Fetch multiplier mapping: Check RAW Geography first, fallback to MAP code
-                            mult = pmf_dict.get((normalize_geo(geo), season_norm, col_u))
-                            if mult is None and pd.notna(map_code):
-                                mult = pmf_dict.get((normalize_geo(map_code), season_norm, col_u))
+                            # Fetch multiplier mapping using pre-computed normalized strings
+                            mult = pmf_dict.get((geo_norm, season_norm, col_u))
+                            if mult is None and map_code_norm is not None:
+                                mult = pmf_dict.get((map_code_norm, season_norm, col_u))
 
-                            if mult is None or pd.isna(col_values.iat[i]):
+                            val = col_values[i]
+                            if mult is None or np.isnan(val):
                                 continue
 
                             # --- UPPER LIMIT CHECK ---
                             if mult >= max_multiplier_limit:
-                                skipped_rows.append((i, geo, season, map_code, col, f"Exceeds Limit ({mult:.3f})"))
+                                skipped_rows.append((i, geo_raw, season_raw, map_code_raw, col, f"Exceeds Limit ({mult:.3f})"))
                                 continue
 
                             # --- TOLERANCE CHECK ---
                             if t_min < mult < t_max:
-                                skipped_rows.append((i, geo, season, map_code, col, f"Tolerance ({mult:.3f})"))
+                                skipped_rows.append((i, geo_raw, season_raw, map_code_raw, col, f"Tolerance ({mult:.3f})"))
                                 continue
 
-                            updated = col_values.iat[i] * mult
-                            result_ads.at[i, col] = str(updated)
-                            multiplied_rows.append((i, geo, season, map_code, col, col_values.iat[i], mult, updated))
+                            # Apply math and save to the NumPy array (Instantaneous)
+                            updated = val * mult
+                            new_col_strings[i] = str(updated)
+                            multiplied_rows.append((i, geo_raw, season_raw, map_code_raw, col, val, mult, updated))
+                            
+                        # Overwrite the Pandas column all at once at the very end
+                        result_ads[col] = new_col_strings
                     
                     # 5. Save Results to Session State
                     log_output = io.BytesIO()
