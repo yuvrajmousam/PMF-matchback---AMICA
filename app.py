@@ -66,7 +66,7 @@ st.markdown("""
     .bose-letter:nth-child(2) { animation-delay: 0.15s; }
     .bose-letter:nth-child(3) { animation-delay: 0.3s; }
     .bose-letter:nth-child(4) { animation-delay: 0.45s; }
-    .bose-letter:nth-child(4) { animation-delay: 0.60s; }
+    .bose-letter:nth-child(5) { animation-delay: 0.60s; }
 
     /* Status Text */
     .bose-status {
@@ -97,45 +97,83 @@ st.markdown("""
 # 3. HELPER FUNCTIONS
 # ---------------------------------------------------------
 def normalize_geo(name: str):
-    """Normalizes geography names to handle mismatch (e.g. 'Bose UK' vs 'BOSE_UK')"""
+    """Normalizes geography names to handle mismatch."""
     if pd.isna(name): return ""
     return str(name).strip().upper().replace(".", "").replace("_", "").replace(" ", "")
 
+def normalize_season(name: str):
+    """Aggressively strips spaces, underscores, and dashes from seasons to force matches."""
+    if pd.isna(name): return ""
+    return str(name).strip().upper().replace(" ", "").replace("_", "").replace("-", "")
+
 def generate_dynamic_pmf(last_df, curr_df, model_key, var_col, geo_col):
-    """Calculates PMF multipliers by dividing Last Weekly by Current Weekly."""
-    last_sub = last_df[last_df['ModelKey'] == model_key].copy()
-    curr_sub = curr_df[curr_df['ModelKey'] == model_key].copy()
+    """Calculates PMF multipliers by dividing Last Weekly by Current Weekly with strict data cleaning."""
+    last_df = last_df.copy()
+    curr_df = curr_df.copy()
     
+    # Strip column headers to prevent invisible space mismatch
+    last_df.columns = [str(c).strip() for c in last_df.columns]
+    curr_df.columns = [str(c).strip() for c in curr_df.columns]
+    var_col = str(var_col).strip()
+    geo_col = str(geo_col).strip()
+    
+    # Force ModelKey to String for strict filtering
+    if 'ModelKey' in last_df.columns:
+        last_df['ModelKey'] = last_df['ModelKey'].astype(str).str.strip()
+    if 'ModelKey' in curr_df.columns:
+        curr_df['ModelKey'] = curr_df['ModelKey'].astype(str).str.strip()
+        
+    model_key_str = str(model_key).strip()
+    
+    last_sub = last_df[last_df['ModelKey'] == model_key_str].copy()
+    curr_sub = curr_df[curr_df['ModelKey'] == model_key_str].copy()
+    
+    # Identify common period columns safely
     meta_cols = ['ModelKey', var_col, geo_col]
-    period_cols = [c for c in last_sub.columns if c not in meta_cols and not str(c).startswith("Unnamed:")]
+    period_cols_last = [c for c in last_sub.columns if c not in meta_cols and not str(c).startswith("Unnamed:")]
+    period_cols_curr = [c for c in curr_sub.columns if c not in meta_cols and not str(c).startswith("Unnamed:")]
+    common_periods = list(set(period_cols_last).intersection(set(period_cols_curr)))
     
-    last_long = last_sub.melt(id_vars=[geo_col, var_col], value_vars=period_cols, 
+    if not common_periods:
+        st.error(f"❌ MERGE FAILED: No matching period columns found between Last Weekly and Current Weekly. Last periods: {period_cols_last[:3]}...")
+        st.stop()
+    
+    # Melt
+    last_long = last_sub.melt(id_vars=[geo_col, var_col], value_vars=common_periods, 
                               var_name="SEASON", value_name="LAST_VAL")
-    curr_long = curr_sub.melt(id_vars=[geo_col, var_col], value_vars=period_cols, 
+    curr_long = curr_sub.melt(id_vars=[geo_col, var_col], value_vars=common_periods, 
                               var_name="SEASON", value_name="CURR_VAL")
     
-    merged = pd.merge(last_long, curr_long, on=[geo_col, var_col, "SEASON"], how="inner")
+    # Clean merge keys heavily to guarantee inner join success
+    for df in [last_long, curr_long]:
+        df[geo_col] = df[geo_col].astype(str).str.strip().str.upper()
+        df[var_col] = df[var_col].astype(str).str.strip().str.upper()
+        df["SEASON_NORM"] = df["SEASON"].apply(normalize_season)
+        
+    merged = pd.merge(last_long, curr_long, on=[geo_col, var_col, "SEASON_NORM"], how="inner", suffixes=('_l', '_c'))
+    
+    if merged.empty:
+        st.error("❌ MERGE FAILED: The inner join between Last and Current weekly data resulted in 0 rows. Check Geography and Variable values.")
+        st.stop()
     
     merged["LAST_VAL"] = pd.to_numeric(merged["LAST_VAL"], errors="coerce").fillna(0)
     merged["CURR_VAL"] = pd.to_numeric(merged["CURR_VAL"], errors="coerce").fillna(0)
     
-    # Apply logic: if either is 0, multiplier is 1.0. Otherwise Last / Current
     merged["MULTIPLIER"] = np.where(
         (merged["CURR_VAL"] == 0) | (merged["LAST_VAL"] == 0), 
         1.0, 
         merged["LAST_VAL"] / merged["CURR_VAL"]
     )
     
-    factors_df = merged[[geo_col, "SEASON", var_col, "LAST_VAL", "CURR_VAL", "MULTIPLIER"]].copy()
-    factors_df.rename(columns={geo_col: "GEOGRAPHY", var_col: "VARIABLE"}, inplace=True)
+    factors_df = merged[[geo_col, "SEASON_l", var_col, "LAST_VAL", "CURR_VAL", "MULTIPLIER"]].copy()
+    factors_df.rename(columns={geo_col: "GEOGRAPHY", "SEASON_l": "SEASON", var_col: "VARIABLE"}, inplace=True)
     
     pmf_dict = {}
     for _, row in factors_df.iterrows():
         geo = normalize_geo(row["GEOGRAPHY"])
-        season = str(row["SEASON"]).strip().upper()
-        # Explicitly adding _PMF to match the ADS headers
+        season_norm = normalize_season(row["SEASON"])
         var = str(row["VARIABLE"]).strip().upper() + "_PMF" 
-        pmf_dict[(geo, season, var)] = row["MULTIPLIER"]
+        pmf_dict[(geo, season_norm, var)] = row["MULTIPLIER"]
         
     return pmf_dict, factors_df
 
@@ -154,6 +192,8 @@ if 'processed_logs' not in st.session_state:
     st.session_state.processed_logs = None
 if 'factors_file_bytes' not in st.session_state:
     st.session_state.factors_file_bytes = None
+if 'factors_df' not in st.session_state:
+    st.session_state.factors_df = None
 if 'file_signatures' not in st.session_state:
     st.session_state.file_signatures = None
 
@@ -228,8 +268,12 @@ if all(current_files):
         
         # WEEKLY FILE MAPPING
         st.markdown("##### 📅 Weekly Data Mapping")
-        cols_list = list(last_weekly_df.columns)
-        available_models = last_weekly_df['ModelKey'].dropna().unique().tolist() if 'ModelKey' in cols_list else []
+        cols_list = [str(c).strip() for c in last_weekly_df.columns]
+        
+        available_models = []
+        if 'ModelKey' in cols_list:
+            available_models = last_weekly_df.iloc[:, cols_list.index('ModelKey')].dropna().astype(str).unique().tolist()
+            
         selected_model = st.selectbox("Select ModelKey:", available_models)
         
         default_geo_idx = cols_list.index("DataBase") if "DataBase" in cols_list else 0
@@ -289,7 +333,6 @@ if all(current_files):
                 </div>
                 """, unsafe_allow_html=True)
 
-                # Give browser time to render animation
                 time.sleep(0.8)
 
                 try:
@@ -345,7 +388,7 @@ if all(current_files):
                             if "VARIABLE" in gdf.columns and "CONTRIBUTION" in gdf.columns:
                                 gdf = gdf.dropna(subset=["CONTRIBUTION"])
                                 for _, row in gdf.iterrows():
-                                    contrib_val = str(row["CONTRIBUTION"]).strip().upper()
+                                    contrib_val = normalize_season(row["CONTRIBUTION"])
                                     if contrib_val not in ["NAN", "NONE", ""]:
                                         skip_triples.add((f"{str(row['VARIABLE']).strip().upper()}_PMF", contrib_val, sheet_code))
 
@@ -355,15 +398,15 @@ if all(current_files):
                         gdf_over = pd.read_excel(gran_file, sheet_name=over_sheet, dtype=str)
                         gdf_over.columns = [str(c).strip().upper() for c in gdf_over.columns]
                         
-                        # Use GEOGRAPHY and let geo2map translate it to the MAP code
                         if "GEOGRAPHY" in gdf_over.columns and "VARIABLE" in gdf_over.columns and "CONTRIBUTION" in gdf_over.columns:
                             gdf_over = gdf_over.dropna(subset=["CONTRIBUTION"])
                             for _, row in gdf_over.iterrows():
-                                contrib_val = str(row["CONTRIBUTION"]).strip().upper()
+                                contrib_val = normalize_season(row["CONTRIBUTION"])
                                 if contrib_val not in ["NAN", "NONE", ""]:
                                     raw_geo = str(row["GEOGRAPHY"]).strip().upper()
                                     mapped_code = geo2map.get(raw_geo, raw_geo) 
                                     skip_triples.add((f"{str(row['VARIABLE']).strip().upper()}_PMF", contrib_val, mapped_code))
+
                     # 4. Apply Multipliers
                     result_ads = ads_df.copy()
                     skipped_rows = []
@@ -382,7 +425,7 @@ if all(current_files):
 
                     for col in common_vars:
                         col_u = col.upper()
-                        col_base = col_u.replace("_PMF", "")
+                        col_base = col_u.replace("_PMF", "").strip()
 
                         if selected_type_category != "All" and col_base not in allowed_vars:
                             continue
@@ -394,15 +437,18 @@ if all(current_files):
                         
                         for i in range(len(result_ads)):
                             season = S_arr[i]
+                            season_norm = normalize_season(season)
                             map_code = M_arr[i]
                             geo = G_arr[i]
 
-                            if (col_u, season, map_code) in skip_triples:
+                            if (col_u, season_norm, map_code) in skip_triples:
                                 skipped_rows.append((i, geo, season, map_code, col, "Granular Spec"))
                                 continue
                             
-                            # Fetch multiplier mapping
-                            mult = pmf_dict.get((normalize_geo(geo), season, col_u))
+                            # Fetch multiplier mapping: Check RAW Geography first, fallback to MAP code
+                            mult = pmf_dict.get((normalize_geo(geo), season_norm, col_u))
+                            if mult is None and pd.notna(map_code):
+                                mult = pmf_dict.get((normalize_geo(map_code), season_norm, col_u))
 
                             if mult is None or pd.isna(col_values.iat[i]):
                                 continue
@@ -429,6 +475,7 @@ if all(current_files):
                     
                     st.session_state.processed_data = result_ads.to_csv(index=False).encode()
                     st.session_state.processed_logs = log_output.getvalue()
+                    st.session_state.factors_df = factors_df
                     st.session_state.factors_file_bytes = create_factors_excel(factors_df)
                     
                     st.session_state.scaled_filename = f"{ads_filename}_Scaled_{selected_type_category}_{today_str}.csv"
@@ -479,6 +526,10 @@ if st.session_state.processed_data is not None:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
+            
+        st.divider()
+        st.subheader("👀 Preview Calculated Factors")
+        st.dataframe(st.session_state.factors_df)
     
     st.divider()
     if st.button("🔄 Reset and Start Over", type="secondary"):
