@@ -107,7 +107,19 @@ def normalize_season(name: str):
     return str(name).strip().upper().replace(" ", "").replace("_", "").replace("-", "")
 
 def generate_dynamic_pmf(last_df, curr_df, model_key, var_col, geo_col):
-    """Calculates PMF multipliers by dividing Last Weekly by Current Weekly with strict data cleaning."""
+    """
+    Calculates PMF multipliers by dividing Last Weekly by Current Weekly with strict data cleaning.
+
+    FIX: This function used to call st.error()/st.stop() directly on failure.
+    st.stop() raises Streamlit's StopException, which subclasses BaseException
+    (not Exception), so it silently skipped the caller's `except Exception`
+    handler. That meant the full-screen loading overlay never got cleared
+    (loader_placeholder.empty() never ran) and the app looked permanently
+    "stuck" on the animation, when in fact it had already halted underneath
+    it with an invisible error. Now this function raises normal ValueErrors,
+    which the calling code's try/except Exception block catches correctly,
+    clears the loader, and displays the error.
+    """
     last_df = last_df.copy()
     curr_df = curr_df.copy()
     
@@ -135,8 +147,11 @@ def generate_dynamic_pmf(last_df, curr_df, model_key, var_col, geo_col):
     common_periods = list(set(period_cols_last).intersection(set(period_cols_curr)))
     
     if not common_periods:
-        st.error(f"❌ MERGE FAILED: No matching period columns found between Last Weekly and Current Weekly. Last periods: {period_cols_last[:3]}...")
-        st.stop()
+        # FIXED: raise instead of st.error()+st.stop()
+        raise ValueError(
+            f"MERGE FAILED: No matching period columns found between Last Weekly "
+            f"and Current Weekly. Last periods: {period_cols_last[:3]}..."
+        )
     
     # Melt
     last_long = last_sub.melt(id_vars=[geo_col, var_col], value_vars=common_periods, 
@@ -153,8 +168,11 @@ def generate_dynamic_pmf(last_df, curr_df, model_key, var_col, geo_col):
     merged = pd.merge(last_long, curr_long, on=[geo_col, var_col, "SEASON_NORM"], how="inner", suffixes=('_l', '_c'))
     
     if merged.empty:
-        st.error("❌ MERGE FAILED: The inner join between Last and Current weekly data resulted in 0 rows. Check Geography and Variable values.")
-        st.stop()
+        # FIXED: raise instead of st.error()+st.stop()
+        raise ValueError(
+            "MERGE FAILED: The inner join between Last and Current weekly data "
+            "resulted in 0 rows. Check Geography and Variable values."
+        )
     
     merged["LAST_VAL"] = pd.to_numeric(merged["LAST_VAL"], errors="coerce").fillna(0)
     merged["CURR_VAL"] = pd.to_numeric(merged["CURR_VAL"], errors="coerce").fillna(0)
@@ -342,6 +360,10 @@ if all(current_files):
                     today_str = date.today().isoformat()
                     
                     # 1. Generate Dynamic Factors Dictionary
+                    # NOTE: generate_dynamic_pmf now raises ValueError on failure
+                    # instead of calling st.stop() itself, so this outer
+                    # except Exception block reliably catches it and clears
+                    # the loader before showing the error.
                     pmf_dict, factors_df = generate_dynamic_pmf(
                         last_weekly_df, 
                         curr_weekly_df, 
@@ -362,6 +384,7 @@ if all(current_files):
                     season_col = next((c for c in ads_df.columns if c.upper() in ["SEASON", "PERIOD_DEFINITION", "TIME_PERIODS"]), None)
 
                     if not geo_col or not season_col:
+                        # This one already clears the loader before st.stop() -- correct pattern.
                         loader_placeholder.empty()
                         st.error("❌ ADS missing Geography or Season column.")
                         st.stop()
@@ -500,6 +523,10 @@ if all(current_files):
                     st.rerun()
 
                 except Exception as e:
+                    # FIXED: this now actually catches merge/validation failures
+                    # from generate_dynamic_pmf (which used to bypass this via
+                    # st.stop()'s BaseException). The loader is cleared before
+                    # the error is shown, so the app no longer looks "frozen".
                     loader_placeholder.empty()
                     st.error(f"An error occurred: {e}")
                     st.stop()
